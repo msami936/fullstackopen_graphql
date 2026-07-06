@@ -1,6 +1,15 @@
 require('dotenv').config()
 const { ApolloServer } = require('@apollo/server')
-const { startStandaloneServer } = require('@apollo/server/standalone')
+const { expressMiddleware } = require('@as-integrations/express4')
+const {
+  ApolloServerPluginDrainHttpServer,
+} = require('@apollo/server/plugin/drainHttpServer')
+const { makeExecutableSchema } = require('@graphql-tools/schema')
+const express = require('express')
+const http = require('http')
+const cors = require('cors')
+const { WebSocketServer } = require('ws')
+const { useServer } = require('graphql-ws/use/ws')
 const mongoose = require('mongoose')
 const jwt = require('jsonwebtoken')
 const typeDefs = require('./schema')
@@ -42,6 +51,10 @@ const connectWithPrimaryFallback = async (user, password, db, clusterHosts) => {
 }
 
 const connectToDatabase = async () => {
+  if (process.env.MONGODB_URI) {
+    return mongoose.connect(process.env.MONGODB_URI)
+  }
+
   const user = process.env.MONGODB_USER
   const password = process.env.MONGODB_PASSWORD
   const db = process.env.MONGODB_DB || 'graphql-library'
@@ -73,10 +86,19 @@ const connectToDatabase = async () => {
     }
   }
 
-  const uri =
-    process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/graphql-library'
+  const uri = 'mongodb://127.0.0.1:27017/graphql-library'
 
   return mongoose.connect(uri)
+}
+
+const getContext = async ({ req }) => {
+  const auth = req ? req.headers.authorization : null
+  if (auth && auth.startsWith('Bearer ')) {
+    const decodedToken = jwt.verify(auth.substring(7), process.env.JWT_SECRET)
+    const currentUser = await User.findById(decodedToken.id)
+    return { currentUser }
+  }
+  return {}
 }
 
 const start = async () => {
@@ -102,28 +124,49 @@ const start = async () => {
 
   await seedDatabase()
 
+  const schema = makeExecutableSchema({ typeDefs, resolvers })
+  const app = express()
+  const httpServer = http.createServer(app)
+
+  const wsServer = new WebSocketServer({
+    server: httpServer,
+    path: '/',
+  })
+
+  const serverCleanup = useServer({ schema }, wsServer)
+
   const server = new ApolloServer({
-    typeDefs,
-    resolvers,
+    schema,
+    plugins: [
+      ApolloServerPluginDrainHttpServer({ httpServer }),
+      {
+        async serverWillStart() {
+          return {
+            async drainServer() {
+              await serverCleanup.dispose()
+            },
+          }
+        },
+      },
+    ],
   })
 
-  const { url } = await startStandaloneServer(server, {
-    listen: { port: 4000 },
-    context: async ({ req }) => {
-      const auth = req ? req.headers.authorization : null
-      if (auth && auth.startsWith('Bearer ')) {
-        const decodedToken = jwt.verify(
-          auth.substring(7),
-          process.env.JWT_SECRET,
-        )
-        const currentUser = await User.findById(decodedToken.id)
-        return { currentUser }
-      }
-      return {}
-    },
-  })
+  await server.start()
 
-  console.log(`Server ready at ${url}`)
+  app.use(
+    '/',
+    cors(),
+    express.json(),
+    expressMiddleware(server, {
+      context: getContext,
+    }),
+  )
+
+  const PORT = process.env.PORT || 4000
+
+  httpServer.listen(PORT, () => {
+    console.log(`Server ready at http://localhost:${PORT}/`)
+  })
 }
 
 start()

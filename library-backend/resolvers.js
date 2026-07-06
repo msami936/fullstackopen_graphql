@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken')
 const Author = require('./models/author')
 const Book = require('./models/book')
 const User = require('./models/user')
+const pubsub = require('./pubsub')
 
 const resolvers = {
   Query: {
@@ -25,7 +26,21 @@ const resolvers = {
 
       return Book.find(filter).populate('author')
     },
-    allAuthors: async () => Author.find({}),
+    allAuthors: async () => {
+      const authors = await Author.find({})
+      const bookCounts = await Book.aggregate([
+        { $group: { _id: '$author', count: { $sum: 1 } } },
+      ])
+
+      const countMap = Object.fromEntries(
+        bookCounts.map(({ _id, count }) => [_id.toString(), count]),
+      )
+
+      return authors.map((author) => ({
+        ...author.toObject(),
+        bookCount: countMap[author._id.toString()] || 0,
+      }))
+    },
     me: (root, args, context) => context.currentUser,
   },
   Mutation: {
@@ -74,7 +89,11 @@ const resolvers = {
         })
       }
 
-      return Book.findById(book._id).populate('author')
+      const populatedBook = await Book.findById(book._id).populate('author')
+
+      await pubsub.publish('BOOK_ADDED', { bookAdded: populatedBook })
+
+      return populatedBook
     },
     editAuthor: async (root, args, context) => {
       const currentUser = context.currentUser
@@ -151,11 +170,22 @@ const resolvers = {
       return true
     },
   },
+  Subscription: {
+    bookAdded: {
+      subscribe: () => pubsub.asyncIterableIterator(['BOOK_ADDED']),
+    },
+  },
   User: {
     id: (root) => root.id || root._id.toString(),
   },
   Author: {
-    bookCount: async (root) => Book.countDocuments({ author: root._id }),
+    bookCount: async (root) => {
+      if (typeof root.bookCount === 'number') {
+        return root.bookCount
+      }
+
+      return Book.countDocuments({ author: root._id })
+    },
     id: (root) => root.id || root._id.toString(),
   },
   Book: {
